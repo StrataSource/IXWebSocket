@@ -63,6 +63,14 @@ namespace ix
                       CERT_SYSTEM_STORE_CURRENT_USER;
         HCERTSTORE systemStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0, flags, L"Root");
 
+        // The current user store fails when its registry key is missing (e.g. fresh Wine prefixes)
+        if (!systemStore)
+        {
+            flags = CERT_STORE_READONLY_FLAG | CERT_STORE_OPEN_EXISTING_FLAG |
+                    CERT_SYSTEM_STORE_LOCAL_MACHINE;
+            systemStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0, flags, L"Root");
+        }
+
         if (!systemStore)
         {
             errorMsg = "CertOpenStore failed with ";
