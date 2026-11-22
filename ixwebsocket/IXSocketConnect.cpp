@@ -11,9 +11,13 @@
 #include "IXSelectInterrupt.h"
 #include "IXSocket.h"
 #include "IXUniquePtr.h"
+#include <algorithm>
+#include <chrono>
 #include <fcntl.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
+#include <vector>
 
 // Android needs extra headers for TCP_NODELAY and IPPROTO_TCP
 #ifdef ANDROID
@@ -23,6 +27,8 @@
 
 namespace ix
 {
+    static constexpr auto kAddressConnectTimeout = std::chrono::seconds(5);
+
     //
     // This function can be cancelled every 50 ms
     // This is important so that we don't block the main UI thread when shutting down a
@@ -106,20 +112,80 @@ namespace ix
             return -1;
         }
 
-        int sockfd = -1;
-
-        // iterate through the records to find a working peer
-        struct addrinfo* address;
-        for (address = res.get(); address != nullptr; address = address->ai_next)
+        // Alternate address families, so a family that silently drops packets (e.g. broken
+        // IPv6) only costs one per-address timeout before the other family is tried
+        std::vector<const struct addrinfo*> addresses;
         {
-            //
-            // Second try to connect to the remote host
-            //
-            sockfd = connectToAddress(address, errMsg, isCancellationRequested);
+            std::vector<const struct addrinfo*> firstFamily, otherFamily;
+            for (const struct addrinfo* address = res.get(); address != nullptr;
+                 address = address->ai_next)
+            {
+                if (address->ai_family == res->ai_family)
+                    firstFamily.push_back(address);
+                else
+                    otherFamily.push_back(address);
+            }
+
+            for (size_t i = 0; i < (std::max)(firstFamily.size(), otherFamily.size()); ++i)
+            {
+                if (i < firstFamily.size()) addresses.push_back(firstFamily[i]);
+                if (i < otherFamily.size()) addresses.push_back(otherFamily[i]);
+            }
+        }
+
+        int sockfd = -1;
+        std::string errors;
+
+        for (size_t i = 0; i < addresses.size(); ++i)
+        {
+            const struct addrinfo* address = addresses[i];
+
+            // The last address gets whatever is left of the caller's timeout
+            const bool isLastAddress = (i + 1 == addresses.size());
+            const auto deadline = std::chrono::steady_clock::now() + kAddressConnectTimeout;
+            bool timedOut = false;
+
+            const CancellationRequest isAttemptCancelled = [&]() -> bool {
+                if (isCancellationRequested && isCancellationRequested()) return true;
+
+                if (!isLastAddress && std::chrono::steady_clock::now() > deadline)
+                {
+                    timedOut = true;
+                    return true;
+                }
+
+                return false;
+            };
+
+            std::string addressErrMsg;
+            sockfd = connectToAddress(address, addressErrMsg, isAttemptCancelled);
             if (sockfd != -1)
             {
+                errMsg = addressErrMsg;
                 break;
             }
+
+            char host[NI_MAXHOST];
+            if (getnameinfo(address->ai_addr,
+                            static_cast<socklen_t>(address->ai_addrlen),
+                            host,
+                            sizeof(host),
+                            nullptr,
+                            0,
+                            NI_NUMERICHOST) != 0)
+            {
+                snprintf(host, sizeof(host), "?");
+            }
+
+            if (!errors.empty()) errors += ", ";
+            errors += std::string(host) + ": " + (timedOut ? "Timed out" : addressErrMsg);
+
+            if (isCancellationRequested && isCancellationRequested()) break;
+        }
+
+        if (sockfd == -1)
+        {
+            errMsg = errors;
         }
 
         return sockfd;
